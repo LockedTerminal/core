@@ -245,6 +245,30 @@ client.transaction.validateTransactionOffline(transactionXdr); // → SorokitRes
 for await (const result of client.transaction.stream(publicKey)) {
   if (result.status === "ok") console.log(result.data.transactions);
 }
+
+// Batch submission — submit many signed XDRs at once
+import { submitBatch, suggestRetryStrategy, getTransactionStatus } from "sorokit-core/transaction";
+
+const batch = await submitBatch([xdr1, xdr2, xdr3], {
+  horizonUrl,
+  networkPassphrase,
+  mode: "sequential", // or "parallel"
+});
+
+if (batch.status === "ok") {
+  // Per-item failures never abort the whole batch. Check each entry individually.
+  for (const [i, tx] of batch.data.transactions.entries()) {
+    if (tx.status === "failed") console.error(`Item ${i} failed: ${tx.error}`);
+  }
+
+  // Inspect one item by index
+  const item = getTransactionStatus(batch.data, 0);
+
+  // Get a retry strategy based on the mix of successes and failures
+  const { data: retry } = suggestRetryStrategy(batch.data);
+  // retry.strategy: "none" | "retry_failed" | "retry_all"
+  // retry.failedIndices: number[] — indices of the failed items
+}
 ```
 
 #### Network-aware fee estimation
@@ -473,6 +497,46 @@ ac.abort();
 ```
 
 The same pattern applies to `client.transaction.stream()`.
+
+### Subscription lifecycle and cleanup
+
+`subscribeToTransactionEvents` and `subscribeToAccountEvents` return an
+`EventSubscription` with a single `unsubscribe()` method. Calling it aborts the
+underlying stream and releases all handles. It is safe to call multiple times.
+
+```ts
+const sub = subscribeToTransactionEvents(
+  horizonUrl,
+  publicKey,
+  ["transaction_confirmed"],
+  (event) => console.log(event),
+);
+
+// Later — stop the subscription and release all handles
+sub.unsubscribe();
+```
+
+An external `AbortSignal` can also stop the subscription from outside the
+subscriber:
+
+```ts
+const controller = new AbortController();
+subscribeToTransactionEvents(
+  horizonUrl,
+  publicKey,
+  ["transaction_confirmed"],
+  (event) => console.log(event),
+  { signal: controller.signal },
+);
+
+// Abort from anywhere
+controller.abort();
+```
+
+The subscription deduplicates events by transaction hash so a transaction is
+delivered at most once per subscription, even if Horizon returns it on
+consecutive polls. `StreamEventEmitter.removeAllListeners()` releases every
+listener in one call when you are tearing down a component.
 
 ### Real-time transaction SSE
 
@@ -875,12 +939,24 @@ const result = await client.transaction.submitTransaction(signedXdr, {
 });
 ```
 
+**Key behavior:**
+
+- The check runs client-side, before any network call, so a failed safety check
+  never consumes a sequence number.
+- Failures return `SorokitErrorCode.MAINNET_SAFETY_LIMIT` with an actionable message
+  that names the required opt-in.
+- Operations whose native exposure cannot be bounded from the XDR (account merges,
+  balance claims, liquidity pool operations, Soroban contract calls) also require
+  `bypassMainnetSafety: true` regardless of the threshold.
+- Testnet, Futurenet, and custom networks are unaffected.
+- `bypassMainnetSafety` must be the literal `true`. Truthy values such as `1`,
+  `"true"`, or `{}` are treated as absent and the check still fires.
+- An invalid threshold (NaN, Infinity, negative) returns `SorokitErrorCode.INVALID_CONFIG`.
+
 Warnings include the native amount, threshold, source account, operation count,
-and operation types whose exposure cannot be determined from XDR. Account merges,
-balance claims, liquidity pools, and contract calls require confirmation even when
-no large amount is visible in the envelope. Native offers and payment spend limits
-are counted with exact stroop arithmetic. Fees, reserve changes, and non-native
-asset valuations are outside this guard. Other networks are unaffected.
+and operation types whose exposure cannot be determined from XDR. Native offers
+and payment spend limits are counted with exact stroop arithmetic. Fees, reserve
+changes, and non-native asset valuations are outside this guard.
 
 Soroban submissions use the same guard. Pass safety options as the fourth argument
 to `client.soroban.execute`, or the fifth to `client.soroban.invoke`:
